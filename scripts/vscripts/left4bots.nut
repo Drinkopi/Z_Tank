@@ -19,6 +19,8 @@ if (!IncludeScript("left4lib_users"))
 	error("[L4B][ERROR] Failed to include 'left4lib_users', please make sure the 'Left 4 Lib' addon is installed and enabled!\n");
 if (!IncludeScript("left4lib_timers"))
 	error("[L4B][ERROR] Failed to include 'left4lib_timers', please make sure the 'Left 4 Lib' addon is installed and enabled!\n");
+if (!IncludeScript("left4lib_timers2"))
+	error("[L4B][ERROR] Failed to include 'left4lib_timers2', please make sure the 'Left 4 Lib' addon is installed and enabled!\n");
 if (!IncludeScript("left4lib_concepts"))
 	error("[L4B][ERROR] Failed to include 'left4lib_concepts', please make sure the 'Left 4 Lib' addon is installed and enabled!\n");
 if (!IncludeScript("left4lib_simplehud"))
@@ -84,7 +86,7 @@ IncludeScript("left4bots_requirements");
 	LastLeadStartVocalize = 0
 	NiceShootSurv = null
 	NiceShootTime = 0
-	IncapBlockNavs = {}
+	//IncapBlockNavs = {}
 	ItemsToAvoid = []
 	TeamShotguns = 0
 	TeamMolotovs = 0
@@ -98,6 +100,7 @@ IncludeScript("left4bots_requirements");
 	ScavengeUseTargetPos = null
 	ScavengeUseType = 0
 	ScavengeBots = {}
+	IncapNavBlockerAreas = {}
 	L4F = false
 	LastSignalType = ""
 	LastSignalTime = 0
@@ -2179,16 +2182,23 @@ if (activator && isWorthPickingUp)
 
 // Loads the given survivor weapon preference file and returns an array with 5 elements (one for each inventory slot)
 // Each element is a sub-array with the weapon list from the highest to the lowest priority one for that inventory slot
+/*
+Support vanilla weapon preference.
+		use '*' and '/' split weapon list into each group(Tier)，each group has a priority.
+		flag for single group:
+			*: no priority, bot will just pick up any one of them.
+			/: have priority.
+	
+	Without any flag or only at the beginning of each line, it is still l4b2 style (all weapons are at the same group, and have priority (determined by *))
+	https://github.com/smilz0/Left4Bots/issues/104
+*/
 ::Left4Bots.LoadWeaponPreferences <- function (survivor, scope)
 {
 	// WeapPref array has one sub-array for each inventory slot
 	// Each sub-array contains the weapons from the highest to the lowest priority one for that inventory slot
-	scope.WeapPref <- [[], [], [], [], []];
+	scope.WeapPref <- [[], [], [], [], []]; 
+	//new format like this: [[[],[]...], [], [], [], []];
 	
-	// WeapNoPref array contains a flag for each inventory slot
-	// The flag indicates whether the priority of the weapons in WeapPref for that slot must be ignored
-	scope.WeapNoPref <- [false, false, false, false, false];
-
 	if (!survivor || !survivor.IsValid() || !scope)
 		return;
 
@@ -2209,30 +2219,43 @@ if (activator && isWorthPickingUp)
 		local line = Left4Utils.StripComments(lines[i]);
 		if (line != "")
 		{
+			local Tier = -1;
 			local weaps = split(line, ",");
 			for (local x = 0; x < weaps.len(); x++)
 			{
 				//delete space characters which cause bug
 				local wp = strip(weaps[x]);
 				
-				if (x == 0 && wp == "*")
-					scope.WeapNoPref[i] = true;
-				else
+				// Start a new line when find a flag
+				if (wp == "*" || wp == "/" || x == 0)
 				{
-					local id = Left4Utils.GetWeaponIdByName(wp);
+					Tier++;
+					local arr = [(wp == "*")] // set NoPref flag into first
+					scope.WeapPref[i].append(arr);
+				}
+				
+				local id = Left4Utils.GetWeaponIdByName(wp);
 
-					//Logger.Debug("LoadWeaponPreferences - i: " + i + " - w: " + wp + " - id: " + id);
+				//Logger.Debug("LoadWeaponPreferences - i: " + i + " - w: " + wp + " - id: " + id);
 
-					if (id > Left4Utils.WeaponId.none && id != Left4Utils.MeleeWeaponId.none && id != Left4Utils.UpgradeWeaponId.none)
-					{
-						scope.WeapPref[i].append(id); // valid weapon
-						c++;
-					}
+				if (id > Left4Utils.WeaponId.none && id != Left4Utils.MeleeWeaponId.none && id != Left4Utils.UpgradeWeaponId.none)
+				{
+					scope.WeapPref[i][Tier].append(id); // valid weapon
+					c++;
 				}
 			}
 		}
 	}
-
+	
+	/*
+	printl(filename);
+	foreach(slot, list in scope.WeapPref)
+	{
+		printl("slot" + slot)
+		__DumpScope(4, list);
+	}
+	*/
+	
 	Logger.Debug("LoadWeaponPreferences - Loaded " + c + " preferences for survivor: " + survivor.GetPlayerName() + " from file: " + filename);
 }
 
@@ -3662,25 +3685,192 @@ if (activator && isWorthPickingUp)
 	return false;
 }
 
-::Left4Bots.IncappedBlockNav <- function (survivor)
+// Enables/Disables bots switching to secondary weapon by setting/unsetting its m_hOwner property
+::Left4Bots.AllowSecondaryWeaponSwitch <- function(bot, allow)
 {
-	local kvs = { classname = "script_nav_blocker", origin = survivor.GetOrigin(), extent = Vector(Settings.incap_block_nav_radius, Settings.incap_block_nav_radius, Settings.incap_block_nav_radius), teamToBlock = "2", affectsFlow = "0" };
-	local ent = g_ModeScript.CreateSingleSimpleEntityFromTable(kvs);
-	ent.ValidateScriptScope();
-	Logger.Debug("Created script_nav_blocker (incapped): " + ent.GetName());
-
-	DoEntFire("!self", "SetParent", "!activator", 0, survivor, ent); // I parent the nav blocker to the survivor entity so it follows him if incap crawling is enabled (not sure the nav areas are updated, though)
-	DoEntFire("!self", "BlockNav", "", 0, null, ent);
-	return ent;
+	local w = Left4Utils.GetInventoryItemInSlot(bot, INV_SLOT_SECONDARY);
+	if (w)
+		NetProps.SetPropEntity(w, "m_hOwner", (allow ? bot : null));
 }
 
-::Left4Bots.IncappedUnblockNav <- function (blocker)
+// Handles the logics for allowing/not allowing to switch to secondary
+::Left4Bots.EnforcePrimaryWeapon <- function(bot, ActiveWeapon)
 {
-	if (!blocker || !blocker.IsValid())
-		return;
+	local canSwitch = true;
+	if ((Settings.enforce_shotgun || Settings.enforce_sniper_rifle) && ActiveWeapon && !bot.IsIncapacitated())
+	{
+		local wp = Left4Utils.GetInventoryItemInSlot(bot, INV_SLOT_PRIMARY);
+		local wp2nd = Left4Utils.GetInventoryItemInSlot(bot, INV_SLOT_SECONDARY);
+		if (wp && wp2nd && Left4Utils.GetAmmoPercent(wp) > 0)
+		{
+			local type = Left4Utils.GetWeaponTypeById(Left4Utils.GetWeaponId(wp));
+			if (type == "shotgun" || type == "sniper_rifle")
+			{
+				local type2nd = Left4Utils.GetWeaponTypeById(Left4Utils.GetWeaponId(wp2nd));
+				local flag = type2nd == "pistol" ? (wp2nd.GetClassname() == "weapon_pistol_magnum" ? 2 : 1) : 
+							 type2nd == "melee" ? 4 : 
+							 type2nd == "chainsaw" ? 8 : 
+							 0;
+				
+				if (flag)
+				{
+					if ((Settings["enforce_" + type] & flag) == flag)
+						canSwitch = false;
+					
+					if (!canSwitch && ActiveWeapon == wp2nd)
+					{
+						NetProps.SetPropEntity(wp2nd, "m_hOwner", bot);
+						bot.SwitchToItem(wp.GetClassname());
+						
+						//if can not switch to primary weapon, at least we still have one, also fixed chainsaw smoking when pickup and switch at the same time
+						return;
+					}
+				}
+			}
+		}
+	}
+	
+	AllowSecondaryWeaponSwitch(bot, canSwitch);
+}
 
-	DoEntFire("!self", "UnblockNav", "", 0, null, blocker);
-	DoEntFire("!self", "Kill", "", 0.1, null, blocker);
+// CONTENTS_MONSTER also hits the survivors, ignore all survivors if needed
+::Left4Bots.TraceLineIgnoreSurvivors <- function (player, traceTable)
+{
+	local Owners = {};
+	foreach (surv in Survivors)
+	{
+		if (surv != player && surv && surv.IsValid())
+		{
+			Owners[surv] <- surv.GetOwnerEntity();
+			NetProps.SetPropEntity(surv, "m_hOwnerEntity", player);
+		}
+	}
+	foreach (surv in L4D1Survivors)
+	{
+		if (surv != player && surv && surv.IsValid())
+		{
+			Owners[surv] <- surv.GetOwnerEntity();
+			NetProps.SetPropEntity(surv, "m_hOwnerEntity", player);
+		}
+	}
+	
+	TraceLine(traceTable);
+	
+	foreach (surv, owner in Owners)
+	{
+		NetProps.SetPropEntity(surv, "m_hOwnerEntity", owner);
+	}
+	Owners.clear();
+}
+
+// Get the distance from the world point to the entity's bounding box
+::Left4Bots.GetDistanceToEntityAABB <- function (worldPt, ent)
+{
+	local entOrigin = ent.GetOrigin();
+	local entAngles = ent.GetClassname() == "player" ? QAngle() : ent.GetAngles(); // always 0 degrees if target is "player" //TODO Test infected
+	local mins = NetProps.GetPropVector(ent, "m_Collision.m_vecMins");
+	local maxs = NetProps.GetPropVector(ent, "m_Collision.m_vecMaxs");
+	
+	// aligns to the ent's axis-aligned bounding box
+	local point = worldPt - entOrigin;
+	if (entAngles.y != 0) point = RotatePosition(entOrigin, QAngle(0, entAngles.y * -1.0, 0), point);
+	if (entAngles.x != 0) point = RotatePosition(entOrigin, QAngle(entAngles.x * -1.0, 0, 0), point);
+	if (entAngles.z != 0) point = RotatePosition(entOrigin, QAngle(0, 0, entAngles.z * -1.0), point);
+	
+	// calc closest point on AABB
+	local closestPt = Vector();
+	closestPt.x = point.x < mins.x ? mins.x : (point.x > maxs.x ? maxs.x : point.x);
+	closestPt.y = point.y < mins.y ? mins.y : (point.y > maxs.y ? maxs.y : point.y);
+	closestPt.z = point.z < mins.z ? mins.z : (point.z > maxs.z ? maxs.z : point.z);
+	
+	return (closestPt - point).Length();
+}
+
+// Bot use weapon/item/button/door/radio/props
+// The distance from bot to target must no more than "player_use_radius"
+// Can be blocked by other entities, except for survivors
+::Left4Bots.CanUseTo <- function (bot, ent, trace = true)
+{
+	local eyePos = bot.EyePosition();
+	local useRadius = Convars.GetFloat("player_use_radius");
+	
+	if (GetDistanceToEntityAABB(eyePos, ent) > useRadius)
+		return false;
+	
+	if (!trace)
+		return true;
+	
+	//mask = CONTENTS_SOLID | CONTENTS_MOVEABLE | CONTENTS_MONSTER | CONTENTS_WINDOW | CONTENTS_GRATE
+	local traceTable = { start = eyePos, end = ent.GetCenter(), ignore = bot, mask = 33570827 };
+	TraceLineIgnoreSurvivors(bot, traceTable);
+	
+	return traceTable.fraction == 1 || traceTable.enthit == ent;
+}
+
+// Gascan and Cola have different use range
+// Only blocked by world
+::Left4Bots.CanPourTo <- function (bot, ent)
+{
+	local eyePos = bot.EyePosition();
+	local useRange = ScavengeUseType == SCAV_TYPE_GASCAN ? Convars.GetFloat("gascan_use_range") : 
+					 ScavengeUseType == SCAV_TYPE_COLA ? Convars.GetFloat("cola_bottles_use_range") : 
+					 0;
+	
+	if (GetDistanceToEntityAABB(eyePos, ent) > useRange)
+		return false;
+	
+	//mask = CONTENTS_SOLID | CONTENTS_MOVEABLE | CONTENTS_WINDOW | CONTENTS_GRATE
+	local traceTable = { start = eyePos, end = ent.GetCenter(), ignore = bot, mask = 16395 };
+	TraceLine(traceTable);
+	
+	return traceTable.fraction == 1 || traceTable.enthit == ent;
+}
+
+// The distance based on "player_use_radius", but max is 96
+// Will be blocked by other entities
+// The correct position is the point on the target's bounding box that is closest to the bot's eye, for simplicity, use center position for trace
+::Left4Bots.CanHealTo <- function (bot, ent)
+{
+	// return true if target is me
+	if (bot == ent)
+		return true;
+	
+	local eyePos = bot.EyePosition();
+	local useRadius = Convars.GetFloat("player_use_radius");
+	if (useRadius > 96)
+		useRadius = 96;
+	
+	if (GetDistanceToEntityAABB(eyePos, ent) > useRadius)
+		return false;
+	
+	//mask = CONTENTS_SOLID | CONTENTS_MOVEABLE | CONTENTS_MONSTER | CONTENTS_WINDOW | CONTENTS_GRATE
+	local traceTable = { start = eyePos, end = ent.GetCenter(), ignore = bot, mask = 33570827 };
+	TraceLine(traceTable);
+	
+	return traceTable.fraction == 1 || traceTable.enthit == ent;
+}
+
+::Left4Bots.IsBotReachOrderPosition <- function (bot, CurrentOrder)
+{
+	switch (CurrentOrder.OrderType)
+	{
+		case "use":
+		case "carry":
+		case "deploy":
+			return CanUseTo(bot, CurrentOrder.DestEnt);
+		
+		case "scavenge":
+			if (!CurrentOrder.DestPos) // we are going to pickup gascan/cola
+				return CanUseTo(bot, CurrentOrder.DestEnt);
+			else if (Settings.scavenge_pour) // now if we need pour it
+				return CanPourTo(bot, ScavengeUseTarget);
+			break;
+		
+		case "heal":
+			return CanHealTo(bot, CurrentOrder.DestEnt);
+	}
+	
+	return false;
 }
 
 // Helps update the COMMANDS.md file on the github repo

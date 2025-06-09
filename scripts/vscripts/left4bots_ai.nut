@@ -623,13 +623,6 @@ enum AI_AIM_TYPE {
 				ret += ", ";
 			ret += "[" + i + "]: " + scope.WeapPref[i].len();
 		}
-		ret += "\n- WeapNoPref: ";
-		for (local i = 0; i < scope.WeapNoPref.len(); i++)
-		{
-			if (i > 0)
-				ret += ", ";
-			ret += scope.WeapNoPref[i].tostring();
-		}
 		ret += "\n- Num. WeaponsToSearch: " + scope.WeaponsToSearch.len() + "\n";
 		ret += "- Num. UpgradesToSearch: " + scope.UpgradesToSearch.len() + "\n";
 	}
@@ -684,13 +677,6 @@ enum AI_AIM_TYPE {
 			if (i > 0)
 				ret += ", ";
 			ret += "[" + i + "]: " + scope.WeapPref[i].len();
-		}
-		ret += "\n- WeapNoPref: ";
-		for (local i = 0; i < scope.WeapNoPref.len(); i++)
-		{
-			if (i > 0)
-				ret += ", ";
-			ret += scope.WeapNoPref[i].tostring();
 		}
 		ret += "\n- Num. WeaponsToSearch: " + scope.WeaponsToSearch.len() + "\n";
 		ret += "- Num. UpgradesToSearch: " + scope.UpgradesToSearch.len() + "\n";
@@ -921,6 +907,9 @@ enum AI_AIM_TYPE {
 		ActiveWeaponId = Left4Utils.GetWeaponId(ActiveWeapon);
 		ActiveWeaponSlot = Left4Utils.GetWeaponSlotById(ActiveWeaponId);
 	}
+
+	// handle switch logic
+	L4B.EnforcePrimaryWeapon(self, ActiveWeapon);
 
 	// Basically, all this CarryItem stuff is because some carriable items despawn as prop_physics and respawn as weapon_* and viceversa when picking/dropping them
 	// and also because the game's "dropped" event does not trigger every time
@@ -1219,6 +1208,9 @@ enum AI_AIM_TYPE {
 		ActiveWeaponSlot = Left4Utils.GetWeaponSlotById(ActiveWeaponId);
 	}
 
+	// handle switch logic
+	L4B.EnforcePrimaryWeapon(self, ActiveWeapon);
+
 	// Can't do anything at the moment
 	if (L4B.SurvivorCantMove(self, Waiting))
 	{
@@ -1322,7 +1314,7 @@ enum AI_AIM_TYPE {
 	}
 
 	// Is the item close enough?
-	if ((self.GetCenter() - pickup.GetCenter()).Length() <= L4B.Settings.pickups_pick_range) // There is a cvar (player_use_radius 96) but idk how the distance is calculated, seems not to be from the player's origin or center
+	if ((self.GetCenter() - pickup.GetCenter()).Length() <= L4B.Settings.pickups_pick_range || L4B.CanUseTo(self, pickup, false)) // There is a cvar (player_use_radius 96) but idk how the distance is calculated, seems not to be from the player's origin or center
 	{
 		// Yes, pick it up
 		L4B.Logger.Debug("[AI]" + self.GetPlayerName() + " - Picking up: " + pickup);
@@ -1465,7 +1457,8 @@ enum AI_AIM_TYPE {
 	}
 
 	// Destination survivor_death_model is still there and no one is defibbing it, let's see if we reached it
-	if ((Origin - MovePos).Length() <= L4B.Settings.move_end_radius_defib)
+	//if ((Origin - MovePos).Length() <= L4B.Settings.move_end_radius_defib)
+	if ((Origin - MoveEnt.GetOrigin()).Length() <= Convars.GetFloat("player_use_radius")) // Only need check this distance
 	{
 		// We reached the dead survivor, but do we have a defibrillator?
 		if (!Left4Utils.HasDefib(self))
@@ -1496,7 +1489,7 @@ enum AI_AIM_TYPE {
 			{
 				// Yes, but can we use it right now?
 				if (CurTime > NetProps.GetPropFloat(ActiveWeapon, "m_flNextPrimaryAttack") + 0.1) // <- Add a little delay or the animation will be bugged
-					L4B.PlayerPressButton(self, BUTTON_ATTACK, 0, MoveEnt, 0, 0, true); // Yes
+					L4B.PlayerPressButton(self, BUTTON_ATTACK, 0, MoveEnt.GetCenter(), 0, 0, true); // Yes
 			}
 			else if (ActiveWeapon && ActiveWeapon.GetClassname() != "weapon_pain_pills" && ActiveWeapon.GetClassname() != "weapon_adrenaline") // We'll run into an infinite switch loop if the vanilla AI wants to use pills/adrenaline
 			{
@@ -1710,7 +1703,7 @@ enum AI_AIM_TYPE {
 		if (!destPos)
 			destPos = MovePos;
 
-		if ((Origin - destPos).Length() <= CurrentOrder.DestRadius)
+		if ((Origin - destPos).Length() <= CurrentOrder.DestRadius || L4B.IsBotReachOrderPosition(self, CurrentOrder))
 		{
 			// Yes, we did
 			// BotReset(); // No longer needed if we set sb_debug_apoproach_wait_time to something like 0.5 or even 0
@@ -1796,7 +1789,7 @@ enum AI_AIM_TYPE {
 		return; // Likely it's still AI_DOOR_ACTION.Saferoom, we must wait until we can actually close it
 
 	// Are we close enough to the door, yet?
-	if ((Origin - doorPos).Length() <= L4B.Settings.move_end_radius_door)
+	if ((Origin - doorPos).Length() <= L4B.Settings.move_end_radius_door || L4B.CanUseTo(self, DoorEnt))
 	{
 		// Yes, open/close it
 
@@ -2253,7 +2246,6 @@ enum AI_AIM_TYPE {
 
 	local slotIdx = 0;
 	local useWeapon = (slotIdx in UseWeapons) ? UseWeapons[slotIdx] : 0;
-	local noPref = WeapNoPref[slotIdx];
 	if (L4B.Settings.pickups_wep_always || (MovePos && MoveType == AI_MOVE_TYPE.Order && Paused == 0))
 	{
 		// PRIMARY
@@ -2279,27 +2271,47 @@ enum AI_AIM_TYPE {
 			else
 			{
 				// We either don't have a shotgun or TeamShotguns > team_min_shotguns so we can follow our preference and try to get an higher priority weapon
-
-				if (noPref)
+				
+				local stop = false; // If find weapon in the current Tier, stop add weapons.
+				foreach (Tier, list in WeapPref[slotIdx])
 				{
-					// If priority must be ignored, add all the listed weapons for this slot. Order doesn't matter
-					if (currWeps[slotIdx] == Left4Utils.WeaponId.none || priAmmoPercent < L4B.Settings.pickups_wep_replace_ammo)
+					if (list.len() < 2) // The list must contain at least two items: [noPref, weapon...]
+						continue;
+					
+					if (list[0]) // noPref
 					{
-						for (local x = 0; x < WeapPref[slotIdx].len(); x++)
-							WeaponsToSearch[WeapPref[slotIdx][x]] <- 0;
-					}
-				}
-				else
-				{
-					for (local x = 0; x < WeapPref[slotIdx].len(); x++)
-					{
-						// Add all the preference weapons that have higher priority than the one we have in the inventory
-						// Or add them all if ammo percent of our primary weapon is < pickups_wep_replace_ammo
-						local prefId = WeapPref[slotIdx][x];
-						if (prefId != currWeps[slotIdx] || priAmmoPercent < L4B.Settings.pickups_wep_replace_ammo)
-							WeaponsToSearch[prefId] <- 0;
+						// If priority must be ignored, add all the listed weapons for this slot. Order doesn't matter
+						if (currWeps[slotIdx] == Left4Utils.WeaponId.none || priAmmoPercent < L4B.Settings.pickups_wep_replace_ammo || list.find(currWeps[slotIdx]) == null) // <- this will also include the first element (noPref) but that boolean won't match an integer with the weapon id so it shouldn't be a problem
+						{
+							// Start from 1 to skip the noPref element
+							for (local x = 1; x < list.len(); x++)
+								WeaponsToSearch[list[x]] <- 0;
+						}
 						else
-							break;
+						{
+							stop = true;
+						}
+					}
+					else
+					{
+						for (local x = 1; x < list.len(); x++)
+						{
+							// Add all the preference weapons that have higher priority than the one we have in the inventory
+							// Or add them all if ammo percent of our primary weapon is < pickups_wep_replace_ammo
+							local prefId = list[x];
+							if (prefId != currWeps[slotIdx] || priAmmoPercent < L4B.Settings.pickups_wep_replace_ammo)
+								WeaponsToSearch[prefId] <- 0;
+							else
+							{
+								stop = true;
+								break;
+							}
+						}
+					}
+					
+					if (stop)
+					{
+						break;
 					}
 				}
 
@@ -2321,7 +2333,6 @@ enum AI_AIM_TYPE {
 		// SECONDARY
 		slotIdx = 1;
 		useWeapon = (slotIdx in UseWeapons) ? UseWeapons[slotIdx] : 0;
-		noPref = WeapNoPref[slotIdx];
 		if (useWeapon != 0 && useWeapon == currWeps[slotIdx])
 		{
 			// They ordered to pickup a weapon with the "use" order and we already picked that weapon up. No need to look for other weapons
@@ -2331,54 +2342,69 @@ enum AI_AIM_TYPE {
 			if (useWeapon != 0)
 				WeaponsToSearch[useWeapon] <- 0; // Always add the "use" weapon, if any
 			
-			for (local x = 0; x < WeapPref[slotIdx].len(); x++)
+			local stop = false; // If find weapon in the current Tier, stop add weapons.
+			foreach (Tier, list in WeapPref[slotIdx])
 			{
-				local prefId = WeapPref[slotIdx][x];
-				if (hasChainsaw && L4B.TeamChainsaws > L4B.Settings.team_max_chainsaws)
+				if (list.len() < 2) // The list must contain at least two items: [noPref, weapon...]
+					continue;
+				
+				for (local x = 1; x < list.len(); x++)
 				{
-					// Try to get rid of chainsaw by replacing with anything else
-					if (prefId != Left4Utils.WeaponId.weapon_chainsaw)
+					local prefId = list[x];
+					if (hasChainsaw && L4B.TeamChainsaws > L4B.Settings.team_max_chainsaws)
 					{
-						if (prefId > Left4Utils.MeleeWeaponId.none && L4B.TeamMelee >= L4B.Settings.team_max_melee)
+						// Try to get rid of chainsaw by replacing with anything else
+						if (prefId != Left4Utils.WeaponId.weapon_chainsaw)
 						{
-							// But always take care of the team_max_chainsaws / team_max_melee limits
+							if (prefId > Left4Utils.MeleeWeaponId.none && L4B.TeamMelee >= L4B.Settings.team_max_melee)
+							{
+								// But always take care of the team_max_chainsaws / team_max_melee limits
+							}
+							else
+								WeaponsToSearch[prefId] <- 0;
 						}
-						else
-							WeaponsToSearch[prefId] <- 0;
 					}
-				}
-				else if (hasMelee && L4B.TeamMelee > L4B.Settings.team_max_melee)
-				{
-					// Try to get rid of melee by replacing with any non melee secondary
-					if (prefId < Left4Utils.MeleeWeaponId.none)
+					else if (hasMelee && L4B.TeamMelee > L4B.Settings.team_max_melee)
 					{
-						if (prefId == Left4Utils.WeaponId.weapon_chainsaw && L4B.TeamChainsaws >= L4B.Settings.team_max_chainsaws)
+						// Try to get rid of melee by replacing with any non melee secondary
+						if (prefId < Left4Utils.MeleeWeaponId.none)
 						{
-							// But always take care of the team_max_chainsaws / team_max_melee limits
+							if (prefId == Left4Utils.WeaponId.weapon_chainsaw && L4B.TeamChainsaws >= L4B.Settings.team_max_chainsaws)
+							{
+								// But always take care of the team_max_chainsaws / team_max_melee limits
+							}
+							else
+								WeaponsToSearch[prefId] <- 0;
 						}
-						else
-							WeaponsToSearch[prefId] <- 0;
-					}
-				}
-				else
-				{
-					// If noPref and slot is currently empty, add all the weapons. Order doesn't matter
-					// If !noPref add all the preference weapons that have higher priority than the one we have in the inventory
-					if ((noPref && currWeps[slotIdx] == Left4Utils.WeaponId.none) || (!noPref && prefId != currWeps[slotIdx]))
-					{
-						if ((prefId == Left4Utils.WeaponId.weapon_chainsaw && L4B.TeamChainsaws >= L4B.Settings.team_max_chainsaws) || (prefId > Left4Utils.MeleeWeaponId.none && L4B.TeamMelee >= L4B.Settings.team_max_melee && !hasMelee))
-						{
-							// Take care of the team_max_chainsaws / team_max_melee limits
-						}
-						else if (currWeps[0] == Left4Utils.WeaponId.none && prefId > Left4Utils.MeleeWeaponId.none && !L4B.Settings.pickups_melee_noprimary)
-						{
-							// Don't pickup melee weapons if we don't have a primary weapon and pickups_melee_noprimary is 0
-						}
-						else
-							WeaponsToSearch[prefId] <- 0;
 					}
 					else
-						break;
+					{
+						// If noPref and slot is currently empty, add all the weapons. Order doesn't matter
+						// If !noPref add all the preference weapons that have higher priority than the one we have in the inventory
+						if (list[0] ? currWeps[slotIdx] == Left4Utils.WeaponId.none || list.find(currWeps[slotIdx]) == null : prefId != currWeps[slotIdx])
+						{
+							if ((prefId == Left4Utils.WeaponId.weapon_chainsaw && L4B.TeamChainsaws >= L4B.Settings.team_max_chainsaws) || (prefId > Left4Utils.MeleeWeaponId.none && L4B.TeamMelee >= L4B.Settings.team_max_melee && !hasMelee))
+							{
+								// Take care of the team_max_chainsaws / team_max_melee limits
+							}
+							else if (currWeps[0] == Left4Utils.WeaponId.none && prefId > Left4Utils.MeleeWeaponId.none && !L4B.Settings.pickups_melee_noprimary)
+							{
+								// Don't pickup melee weapons if we don't have a primary weapon and pickups_melee_noprimary is 0
+							}
+							else
+								WeaponsToSearch[prefId] <- 0;
+						}
+						else
+						{
+							stop = true;
+							break;
+						}
+					}
+				}
+				
+				if (stop)
+				{
+					break;
 				}
 			}
 		}
@@ -2394,7 +2420,6 @@ enum AI_AIM_TYPE {
 	// THROWABLES
 	slotIdx = 2;
 	useWeapon = (slotIdx in UseWeapons) ? UseWeapons[slotIdx] : 0;
-	noPref = WeapNoPref[slotIdx];
 	if (useWeapon != 0 && useWeapon == currWeps[slotIdx])
 	{
 		// They ordered to pickup a weapon with the "use" order and we already picked that weapon up. No need to look for other weapons
@@ -2404,41 +2429,60 @@ enum AI_AIM_TYPE {
 		if (useWeapon != 0)
 			WeaponsToSearch[useWeapon] <- 0; // Always add the "use" weapon, if any
 		
-		if (noPref)
+		local stop = false; // If find weapon in the current Tier, stop add weapons.
+		foreach (Tier, list in WeapPref[slotIdx])
 		{
-			// If noPref and slot is currently empty, add all the listed items. Order doesn't matter
-			if (currWeps[slotIdx] == Left4Utils.WeaponId.none)
+			if (list.len() < 2) // The list must contain at least two items: [noPref, weapon...]
+				continue;
+			
+			if (list[0]) // noPref
 			{
-				for (local x = 0; x < WeapPref[slotIdx].len(); x++)
+				// If noPref and slot is currently empty, add all the listed items. Order doesn't matter
+				if (currWeps[slotIdx] == Left4Utils.WeaponId.none || list.find(currWeps[slotIdx]) == null)
 				{
-					// Just take note of all the requested items, we'll build the search list later
-					local prefId = WeapPref[slotIdx][x];
-					if (prefId == Left4Utils.WeaponId.weapon_molotov)
-						wantsMolotov = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_pipe_bomb)
-						wantsPipeBomb = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_vomitjar)
-						wantsVomitJar = true;
-				}
-			}
-		}
-		else
-		{
-			for (local x = 0; x < WeapPref[slotIdx].len(); x++)
-			{
-				// Just take note of the requested higher priority items, we'll build the search list later
-				local prefId = WeapPref[slotIdx][x];
-				if (prefId != currWeps[slotIdx])
-				{
-					if (prefId == Left4Utils.WeaponId.weapon_molotov)
-						wantsMolotov = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_pipe_bomb)
-						wantsPipeBomb = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_vomitjar)
-						wantsVomitJar = true;
+					for (local x = 1; x < list.len(); x++)
+					{
+						// Just take note of all the requested items, we'll build the search list later
+						local prefId = list[x];
+						if (prefId == Left4Utils.WeaponId.weapon_molotov)
+							wantsMolotov = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_pipe_bomb)
+							wantsPipeBomb = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_vomitjar)
+							wantsVomitJar = true;
+					}
 				}
 				else
-					break;
+				{
+					stop = true;
+				}
+			}
+			else
+			{
+				for (local x = 1; x < list.len(); x++)
+				{
+					// Just take note of the requested higher priority items, we'll build the search list later
+					local prefId = list[x];
+					if (prefId != currWeps[slotIdx])
+					{
+						if (prefId == Left4Utils.WeaponId.weapon_molotov)
+							wantsMolotov = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_pipe_bomb)
+							wantsPipeBomb = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_vomitjar)
+							wantsVomitJar = true;
+					}
+					else
+					{
+						stop = true;
+						break;
+					}
+				}
+			}
+			
+			if (stop)
+			{
+				break;
 			}
 		}
 		
@@ -2523,7 +2567,6 @@ enum AI_AIM_TYPE {
 	// MEDKIT
 	slotIdx = 3;
 	useWeapon = (slotIdx in UseWeapons) ? UseWeapons[slotIdx] : 0;
-	noPref = WeapNoPref[slotIdx];
 	if (useWeapon != 0 && useWeapon == currWeps[slotIdx])
 	{
 		// They ordered to pickup a weapon with the "use" order and we already picked that weapon up. No need to look for other weapons
@@ -2533,45 +2576,64 @@ enum AI_AIM_TYPE {
 		if (useWeapon != 0)
 			WeaponsToSearch[useWeapon] <- 0; // Always add the "use" weapon, if any
 		
-		if (noPref)
+		local stop = false; // If find weapon in the current Tier, stop add weapons.
+		foreach (Tier, list in WeapPref[slotIdx])
 		{
-			// If noPref and slot is currently empty, add all the listed items. Order doesn't matter
-			if (currWeps[slotIdx] == Left4Utils.WeaponId.none)
+			if (list.len() < 2) // The list must contain at least two items: [noPref, weapon...]
+				continue;
+			
+			if (list[0]) // noPref
 			{
-				for (local x = 0; x < WeapPref[slotIdx].len(); x++)
+				// If noPref and slot is currently empty, add all the listed items. Order doesn't matter
+				if (currWeps[slotIdx] == Left4Utils.WeaponId.none || list.find(currWeps[slotIdx]) == null)
 				{
-					// Just take note of all the requested items, we'll build the search list later
-					local prefId = WeapPref[slotIdx][x];
-					if (prefId == Left4Utils.WeaponId.weapon_first_aid_kit)
-						wantsMedkit = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_defibrillator)
-						wantsDefib = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_incendiary)
-						wantsUpgdInc = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_explosive)
-						wantsUpgdExp = true;
-				}
-			}
-		}
-		else
-		{
-			for (local x = 0; x < WeapPref[slotIdx].len(); x++)
-			{
-				// Just take note of the requested higher priority items, we'll build the search list later
-				local prefId = WeapPref[slotIdx][x];
-				if (prefId != currWeps[slotIdx])
-				{
-					if (prefId == Left4Utils.WeaponId.weapon_first_aid_kit)
-						wantsMedkit = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_defibrillator)
-						wantsDefib = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_incendiary)
-						wantsUpgdInc = true;
-					else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_explosive)
-						wantsUpgdExp = true;
+					for (local x = 1; x < list.len(); x++)
+					{
+						// Just take note of all the requested items, we'll build the search list later
+						local prefId = list[x];
+						if (prefId == Left4Utils.WeaponId.weapon_first_aid_kit)
+							wantsMedkit = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_defibrillator)
+							wantsDefib = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_incendiary)
+							wantsUpgdInc = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_explosive)
+							wantsUpgdExp = true;
+					}
 				}
 				else
-					break;
+				{
+					stop = true;
+				}
+			}
+			else
+			{
+				for (local x = 1; x < list.len(); x++)
+				{
+					// Just take note of the requested higher priority items, we'll build the search list later
+					local prefId = list[x];
+					if (prefId != currWeps[slotIdx])
+					{
+						if (prefId == Left4Utils.WeaponId.weapon_first_aid_kit)
+							wantsMedkit = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_defibrillator)
+							wantsDefib = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_incendiary)
+							wantsUpgdInc = true;
+						else if (prefId == Left4Utils.WeaponId.weapon_upgradepack_explosive)
+							wantsUpgdExp = true;
+					}
+					else
+					{
+						stop = true;
+						break;
+					}
+				}
+			}
+			
+			if (stop)
+			{
+				break;
 			}
 		}
 		
@@ -2654,7 +2716,6 @@ enum AI_AIM_TYPE {
 	// PILLS
 	slotIdx = 4;
 	useWeapon = (slotIdx in UseWeapons) ? UseWeapons[slotIdx] : 0;
-	noPref = WeapNoPref[slotIdx];
 	if (useWeapon != 0 && useWeapon == currWeps[slotIdx])
 	{
 		// They ordered to pickup a weapon with the "use" order and we already picked that weapon up. No need to look for other weapons
@@ -2664,25 +2725,44 @@ enum AI_AIM_TYPE {
 		if (useWeapon != 0)
 			WeaponsToSearch[useWeapon] <- 0; // Always add the "use" weapon, if any
 		
-		if (noPref)
+		local stop = false; // If find weapon in the current Tier, stop add weapons.
+		foreach (Tier, list in WeapPref[slotIdx])
 		{
-			// If priority must be ignored, add all the listed weapons for this slot. Order doesn't matter
-			if (currWeps[slotIdx] == Left4Utils.WeaponId.none)
+			if (list.len() < 2) // The list must contain at least two items: [noPref, weapon...]
+				continue;
+			
+			if (list[0]) // noPref
 			{
-				for (local x = 0; x < WeapPref[slotIdx].len(); x++)
-					WeaponsToSearch[WeapPref[slotIdx][x]] <- 0;
-			}
-		}
-		else
-		{
-			for (local x = 0; x < WeapPref[slotIdx].len(); x++)
-			{
-				// Add all the preference weapons that have higher priority than the one we have in the inventory
-				local prefId = WeapPref[slotIdx][x];
-				if (prefId != currWeps[slotIdx])
-					WeaponsToSearch[prefId] <- 0;
+				// If priority must be ignored, add all the listed weapons for this slot. Order doesn't matter
+				if (currWeps[slotIdx] == Left4Utils.WeaponId.none || list.find(currWeps[slotIdx]) == null)
+				{
+					for (local x = 1; x < list.len(); x++)
+						WeaponsToSearch[list[x]] <- 0;
+				}
 				else
-					break;
+				{
+					stop = true;
+				}
+			}
+			else
+			{
+				for (local x = 1; x < list.len(); x++)
+				{
+					// Add all the preference weapons that have higher priority than the one we have in the inventory
+					local prefId = list[x];
+					if (prefId != currWeps[slotIdx])
+						WeaponsToSearch[prefId] <- 0;
+					else
+					{
+						stop = true;
+						break;
+					}
+				}
+			}
+			
+			if (stop)
+			{
+				break;
 			}
 		}
 	}
